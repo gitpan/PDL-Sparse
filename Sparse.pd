@@ -1,0 +1,400 @@
+use PDL::PP qw(PDL::Sparse PDL::Sparse Sparse);
+
+pp_bless('PDL::Sparse');
+
+$VERSION = 0.01;
+pp_setversion $VERSION;
+
+pp_addpm( <<'EOPM' );
+
+use strict;
+use File::Spec;
+use overload
+  '==' => \&all_equal,
+  'x'  => \&matmult,
+  fallback => 1;
+
+sub new {
+  my ($package, @dims) = @_;
+  return bless {
+		raw => 1, 
+		indexes => [],
+		values  => [],
+		dims => \@dims,
+		ndims => scalar @dims,
+	       }, $package;
+}
+
+sub all_equal {
+  my ($one, $two) = @_;
+  $two = __PACKAGE__->new_from_pdl($two) unless UNIVERSAL::isa($two, __PACKAGE__);
+
+  # Check that they're the same size
+  return 0 unless $one->dims == $two->dims;
+  foreach (0..$#{$one->{dims}}) {
+    return 0 unless $one->getdim($_) == $two->getdim($_);
+  }
+  
+  # Check the entries
+  return 0 unless PDL::all $one->{indexes} == $two->{indexes};
+  return 0 unless PDL::all $one->{values}  == $two->{values};
+  
+  return 1;
+}
+
+sub density {
+  my $self = shift;
+  my $slots = 1;
+  foreach ($self->dims) { $slots *= $_ }
+  my $entries = $self->{raw} ? @{$self->{values}} : $self->{values}->getdim(0);
+
+  return wantarray ? ($entries, $slots) : $entries/$slots;
+}
+
+sub dims { @{$_[0]->{dims}} }
+sub getdim { $_[0]->{dims}[$_[1]] }
+sub getndims { $_[0]->{ndims} }
+
+sub set {
+  my ($self, @args) = @_;
+  my $val = pop @args;
+  die sprintf "Dimension mismatch: %d vs %d", scalar(@args), $self->{ndims}
+    unless @args == $self->{ndims};
+  
+  return unless $val;  # Don't set it if it's zero
+  push @{$self->{indexes}}, \@args;
+  push @{ $self->{values} }, $val;
+}
+
+sub bake {
+  my ($self) = @_;
+  $self->{indexes} = PDL->new(long, $self->{indexes});
+  $self->{values}  = PDL->new($self->{values});
+  delete $self->{raw};
+  
+  $self->_sort;
+  
+  return $self;
+}
+
+sub _sort {
+  my $self = shift;
+  return $self if $self->{sorted};
+  $self->{sorted} = 1;
+
+  # To sort, we view the entries in $self->{indexes} as the digits of
+  # a base-n number, where n is the maximum of the entries (idea from
+  # Christian Soeller)
+  my $i = $self->{indexes}; # For convenience
+  my $max = $i->max;
+  my $pow = $max ** PDL->sequence($i->getdim(0))->slice('-1:0');
+  my $weighted = $i->inner($pow);
+  my $ix = $weighted->qsorti;
+  
+  $self->{indexes} = $i->dice('X', $ix)->copy;
+  $self->{values}  = $self->{values}->dice($ix)->copy;
+  
+  return $self;
+}
+
+# Pack a representation of a sparse piddle
+sub new_from_pdl {
+  my ($class, $mat) = @_;
+
+  my ($val, @indexes) = $mat->where(
+				    map( $mat->axisvals($_), 0..$mat->getndims-1),
+				    $mat!=0, # the condition
+				   );
+  return bless {
+	        indexes => PDL::append(map {$_->dummy(0)} @indexes),
+                values  => $val,
+                dims    => [$mat->dims],
+		ndims   => $mat->getndims,
+               }, $class;
+}
+
+sub write_to_dir {
+  my ($self, $dir) = @_;
+  foreach my $name ('indexes', 'values') {
+    $self->{$name}->writefraw(File::Spec->catfile($dir, $name));
+  }
+  open my($fh), "> ".File::Spec->catfile($dir, 'dims');
+  print $fh join "\n", @{$self->{dims}};
+}
+
+sub read_from_dir {
+  my ($package, $dir) = @_;
+  my $self = $package->new();
+  open my($fh), "< ".File::Spec->catfile($dir, 'dims');
+  my @dims = <$fh>;
+  chomp @dims;
+  $self->{dims} = \@dims;
+  
+  foreach my $name ('indexes', 'values') {
+    $self->{$name} = PDL->readfraw(File::Spec->catfile($dir, $name));
+  }
+  return $self;
+}
+
+sub normalize {
+  my ($self) = @_;
+  my $ind = $self->{indexes};
+
+  my $norms = zeroes(PDL::float, $self->getdim(0));
+  _normalize($ind, $self->{values}, $norms);
+}
+
+#sub row_inner {
+#  my ($self, $i, $vec) = @_;
+#  my $ind = $self->{indexes};
+#  my $diced = $ind->dice_axis(1, which($ind->slice("(0),") == $i));
+#  # ... do something
+#}
+
+sub inner {
+  my ($self, $vec) = @_;
+  die "Wrong dimensions" unless $vec->getdim(0) == $self->getdim(0);
+  return innersp2d($self->{indexes}, $self->{values}, $vec, $self->getdim(1));
+}
+
+sub xchg {
+  my ($self, $one, $two) = @_;
+  
+  my @dims = $self->dims;
+  @dims[$one, $two] = @dims[$two, $one];
+
+  my $result = bless {
+		      indexes => $self->{indexes}->dice_axis(0, [$one, $two]),
+		      values  => $self->{values},
+		      dims => \@dims,
+	             }, ref($self);
+  $result->_sort unless $self->{nosort};
+  return $result;
+}
+
+sub matmult {
+  my ($sparse, $reg, $flip) = @_;
+
+  if ($flip) {
+    # BA = ((BA)t)t = ((At)(Bt))t
+    local $sparse->{nosort} = 1; # _matmult_pdl() doesn't need sorted indices, so don't bother
+    return $sparse->xchg(1,0)->matmult($reg->xchg(1,0))->xchg(1,0);
+  }
+
+  if ($reg->isa(__PACKAGE__)) {
+    warn "Promoting sparse matrix to PDL in matmult()" if $^W;
+    $reg = $reg->as_pdl;
+  }
+
+  die "Error in matmult: Wrong dims.  Sparse is @{[ $sparse->dims ]} and reg is @{[ $reg->dims ]}"
+    unless $sparse->getdim(0) == $reg->getdim(-1);
+ 
+  my $result = PDL->zeroes($reg->getdim(0), $sparse->getdim(-1));
+  _matmult_pdl($sparse->{indexes}, $sparse->{values}, $reg, $result, $sparse->getdim(1));
+  return $result;
+}
+
+sub as_pdl {
+  my $self = shift;
+  my $pdl = PDL->zeroes($self->{values}->type, $self->dims);
+  _as_pdl($self->{indexes}, $self->{values}, $pdl);
+  return $pdl;
+}
+
+EOPM
+
+pp_def('_as_pdl',
+       Doc => undef,
+       Pars => q{int indexes(two=2,m); values(m); [o] mat(p,q);},
+       Code => q{
+		 loop(m) %{
+		   int i = $indexes(two=>0);
+		   int j = $indexes(two=>1);
+		   $mat(p=>i, q=>j) = $values();
+		 %}
+		},
+      );
+
+# This is safe even when indexes aren't sorted
+pp_def('_matmult_pdl',  # sparse is q,r
+       Doc => undef,
+       Pars => q{int indexes(two=2,m); values(m); mat(p,q); [o] result(p,r)},
+       OtherPars => 'int sparse_d => r',
+       Code => q{
+		 loop(m) %{
+		   int i = $indexes(two=>0);
+		   int j = $indexes(two=>1);
+		   loop(p) %{
+		     $result(r=>j) += $values() * $mat(q=>i);
+		   %}
+		 %}
+		},
+      );
+
+# Only works for 2-d PDLs so far.
+# Assumes no duplicate entries in index list
+pp_def('_normalize',
+       Doc => undef,
+       Pars => q{int msparse(two=2,m); val(m); norms(p)},
+       Code => q{
+                 loop(m) %{
+		   int i = $msparse(two=>1);
+		   $norms(p=>i) += (float)($val() * $val());
+		 %}
+		 loop(p) %{ $norms() = sqrt($norms()); %}
+		 loop(m) %{
+		   int i = $msparse(two=>1);
+		   $val() /= $norms(p=>i);
+		 %}
+                },
+      );
+
+# Only works for 2-d PDLs so far
+pp_def('innersp2d',
+       Doc => undef,
+	Pars => 'int msparse(two=2,m); val(m); vec(nd); [o] res(p)',
+	OtherPars => 'int dp => p',
+	Code => q{
+                  loop(p) %{ $res() = 0; %}
+		  loop(m) %{
+		    int i = $msparse(two=>1);
+		    int j = $msparse(two=>0);
+		    $res(p=>i) += $val() * $vec(nd=>j);
+		  %}
+                 },
+	#Doc => 'a sparse inner product between a (packed) matrix and a vector',
+);
+
+pp_addpm(<<'EOPM');
+
+=head1 NAME
+
+PDL::Sparse - Compact storage for mostly-zero PDLs
+
+=head1 SYNOPSIS
+
+ use PDL;
+ use PDL::Sparse;
+ 
+ # Create a sparse PDL from a real PDL with mostly zeroes
+ my $mat = zeroes(1000,1000);
+ $mat->slice('500:529,500:529') .= random(30,30); # The sparse matrix
+ $mat->slice('30,52') .= 60;                      # One more nonzero entry
+ my $sparse1 = PDL::Sparse->new_from_pdl($mat);
+
+ # Create a sparse PDL from scratch
+ my $sparse2 = new PDL::Sparse(1000, 1000);
+ $sparse2->set(3,4 => 7);  # Set a couple entries to nonzero values
+ $sparse2->set(5,6 => 2);
+ $sparse2->bake;
+ 
+ my $vec = random(1000);         # A normal PDL to multiply with
+ 
+ # Find $mat->inner($vec), but much faster
+ my $result1 = $sparse1->inner($vec);
+
+ # Hand-created sparse pdl works the same way
+ my $result2 = $sparse2->inner($vec);
+
+=head1 DESCRIPTION
+
+This package implements a sparse storage class for PDL.  By "sparse",
+we mean any PDL whose entries are "mostly" zeroes.  For data like
+this, it can be much more efficient (for both memory and speed) to
+keep track of only those entries with nonzero values rather than
+storing all entries.
+
+At this point only a small subset of PDL's regular methods are
+implemented for the sparse PDLs.  Early versions of this module should
+be considered as a "proof of concept", and you should regard the
+interface here as unstable, subject to change whenever people give me
+better ideas.
+
+=head1 METHODS
+
+=head2 C<< PDL::Sparse->new_from_pdl($pdl) >>
+
+This method returns a "packed" PDL::Sparse object that represents the
+same data as in the argument C<$pdl>.
+
+=head2 C<< PDL::Sparse->new(dim1, dim2, ...) >>
+
+Returns a PDL::Sparse object of the given size, with all values
+initialized to zero.  Use the C<set()> and C<bake()> methods to
+finalize the object data for use in calculations.
+
+=head2 C<< $sparse->set(x1, x2, ..., value) >>
+
+Sets an entry in the sparse array to the given value.
+
+=head2 C<< $sparse->cook >>
+
+Readies a PDL::Sparse object for computation.  Note that you either
+create a PDL::Sparse object by doing C<new()>, C<set()>, and
+C<cook()>, or by doing C<new_from_pdl()> - never intermix the two.
+
+=head2 C<< $sparse->inner($vector) >>
+
+Just like the standard PDL method C<inner()> in its function.  At the
+moment there are some strong restrictions on the dimensionality of the
+sparse matrix and the vector - the sparse matrix must be 2-d, and the
+vector must be 1-d.  This restriction may be eased in the future.
+
+Returns the vector result, as a normal PDL object.
+
+=head2 C<< $sparse->matmult($other) >>
+
+Multiplies two 2-d matrices and returns the result.  The C<$other>
+matrix can be either a PDL::Sparse object or a regular PDL object.  If
+you need to multiply by a regular PDL object in the reverse order, you
+can't do C<< $other->matmult($sparse) >>, because that would call the
+wrong method.  Instead, do C<< $sparse->matmult($other, 1) >> to
+reverse the order of the multiplication.
+
+This method is bound to the overloaded C<x> operator, so you can
+simply write C<< $sparse x $other >> instead of the more verbose
+version C<< $sparse->matmult($other) >>.
+
+In the future the result may be returned as a sparse PDL if both
+arguments are sparse.  This usually makes sense.  The only reason I'm
+not doing it now is that I don't quite know how.
+
+=head2 C<< $sparse->normalize >>
+
+Normalizes each row of the 2-d matrix to have Euclidean length 1.
+
+=head2 C<< $sparse->as_pdl >>
+
+Returns a new regular PDL object equivalent to the sparse object.
+
+=head2 C<< $sparse->density >>
+
+In a list context, returns a list containing the number of nonzero
+entries and the total number of (perhaps virtual) entries in the
+sparse PDL.  In a scalar context, returns the ratio of these two
+numbers.
+
+=head2 C<< $sparse->dims >>
+
+Returns the list of dimension sizes, just like a regular PDL object.
+
+=head2 C<< $sparse->getdim($i) >>
+
+Returns the size of the given dimension, just like a regular PDL object.
+
+=head2 C<< $sparse->getndims >>
+
+Returns the number of dimensions, just like a regular PDL object.
+
+=head1 AUTHOR
+
+Ken Williams, ken@mathforum.org
+
+Based on a concept by Christian Soeller (c.soeller@auckland.ac.nz)
+posted to perldl@jach.hawaii.edu Sept. 12, 2000
+
+=cut
+
+EOPM
+
+pp_done();
